@@ -7,7 +7,7 @@
 #include <iostream>
 #include <string>
 
-const uint32_t ROUND = 10;//arr_size / BLOCK;
+const uint32_t ROUND = 5;//arr_size / BLOCK;
 const uint32_t arr_size = 32 * ROUND;
 const uint32_t BLOCK = 32;
 const uint32_t GRID = 1;
@@ -21,13 +21,17 @@ __global__ void l2cache_latency(uint32_t *arr, uint32_t *clock, uint32_t *ret) {
     uint32_t start, end;
     uint32_t stride;
     
-    asm volatile(
-        "ld.global.cg.b32 %0, [%1];\n"
-        : "=r"(stride)
-        : "l"(arr_ptr)
-        : "memory"
-    );
-    arr_ptr += stride;
+#pragma unroll
+    for (int ii = 0; ii < ROUND; ++ii) {
+        asm volatile(
+            "ld.global.ca.b32 %0, [%1];\n"
+            : "=r"(stride)
+            : "l"(arr_ptr)
+            : "memory"
+        );
+        arr_ptr += stride;
+    }
+    arr_ptr -= stride * ROUND;
 
     asm volatile(
         "bar.sync 0;\n"
@@ -37,16 +41,14 @@ __global__ void l2cache_latency(uint32_t *arr, uint32_t *clock, uint32_t *ret) {
         : "memory"
     );
 
-#pragma unroll
-    for (int ii = 0; ii < ROUND; ++ii) {
-        asm volatile(
-            "ld.global.cg.b32 %0, [%1];\n"
-            : "=r"(stride)
-            : "l"(arr_ptr)
-            : "memory"
-        );
-        arr_ptr += stride;
-    }
+    
+    asm volatile(
+        "ld.global.ca.b32 %0, [%1];\n"
+        : "=r"(stride)
+        : "l"(arr_ptr)
+        : "memory"
+    );
+    arr_ptr = arr_ptr + stride;
 
     asm volatile(
         "bar.sync 0;\n"
@@ -56,7 +58,42 @@ __global__ void l2cache_latency(uint32_t *arr, uint32_t *clock, uint32_t *ret) {
         : "memory"
     );
 
-    clock[threadIdx.x] = end-start;
+    auto gap = end - start;
+    arr_ptr -= stride;
+
+    asm volatile(
+        "bar.sync 0;\n"
+        "mov.u32 %0, %%clock;\n"
+        : "=r"(start)
+        :
+        : "memory"
+    );
+    // end and start approximately 56 cycle
+
+
+#pragma unroll
+    for (int ii = 0; ii < ROUND; ++ii) {
+        asm volatile(
+            "ld.global.ca.b32 %0, [%1];\n"
+            : "=r"(stride)
+            : "l"(arr_ptr)
+            : "memory"
+        );
+        arr_ptr = arr_ptr + stride;
+    }
+    // there is about external 10 cycle for + operation
+    // use **ptr to improve
+
+
+    asm volatile(
+        "bar.sync 0;\n"
+        "mov.u32 %0, %%clock;\n"
+        : "=r"(end)
+        :
+        : "memory"
+    );
+
+    clock[threadIdx.x] = end-start-gap;
     if (stride != 0)
     *ret += stride;
     // *ret += *arr_ptr; // man 10cycle
@@ -69,7 +106,7 @@ int main() {
     uint32_t *clock_d;
     uint32_t *ret_d;
     for (int ii = 0; ii < arr_size; ii++) {
-        arr_h[ii] = 0;
+        arr_h[ii] = 128;
     }
     cudaMalloc((void**)&arr_d, 4 * arr_size);
     cudaMalloc((void**)&clock_d, 4 * 32);
@@ -77,7 +114,7 @@ int main() {
 
     cudaMemcpy(arr_d, arr_h, sizeof(int) * arr_size, cudaMemcpyHostToDevice);
 
-    for (int ii = 0; ii < 1000; ii++) {
+    for (int ii = 0; ii < 10000; ii++) {
         l2cache_latency<<<GRID, BLOCK>>>(arr_d, clock_d, ret_d);
     }
 
@@ -89,7 +126,7 @@ int main() {
     cudaDeviceSynchronize();
     std::cout << "error code = " << cudaGetLastError() << std::endl;
 
-    float avg_latency = clock_h[0] / ROUND;
+    float avg_latency = clock_h[0] / (ROUND-1);
 
     std::cout << avg_latency << std::endl;
 
